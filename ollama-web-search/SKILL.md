@@ -1,6 +1,7 @@
 ---
 name: ollama-web-search
 description: Web search via Ollama API. Returns relevant results from Ollama web search for AI agents.
+homepage: https://github.com/QAA-Tools/skills
 metadata: {"clawdbot":{"emoji":"🔎","requires":{"bins":["node"],"env":["OLLAMA_API_KEY"]},"primaryEnv":"OLLAMA_API_KEY"}}
 ---
 
