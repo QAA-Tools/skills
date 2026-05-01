@@ -1,0 +1,7 @@
+{
+  "name": "modular-journal-video-pipeline",
+  "version": "1.0.0",
+  "description": "Design research/journal video pipelines as four layers: source prep, LLM JSON enrichment, rendering, and publishing.",
+  "author": "QAA-Tools",
+  "license": "MIT"
+}
