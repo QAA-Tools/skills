@@ -1,8 +1,10 @@
 ---
 name: modular-journal-video-pipeline
-description: Design journal/news/research video pipelines as four separable layers: source prep, LLM JSON enrichment, JSON-driven rendering, and publishing. Keep orchestration thin so sources and templates can be swapped independently.
+description: "Design journal/news/research video pipelines as four separable layers: source prep, LLM JSON enrichment, JSON-driven rendering, and publishing. Keep orchestration thin so sources and templates can be swapped independently."
 homepage: https://github.com/QAA-Tools/skills
-metadata: {"clawdbot":{"emoji":"🧩"}}
+metadata:
+  clawdbot:
+    emoji: "🧩"
 ---
 
 # Modular Journal Video Pipeline

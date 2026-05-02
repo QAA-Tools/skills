@@ -2,7 +2,12 @@
 name: py-env-setup
 description: Host-specific Python execution guidance for OpenClaw on this machine. Prefer $PYTHON over python/python3 in PATH, because OpenClaw exec runs in a non-interactive shell and may not inherit interactive shell initialization.
 homepage: https://github.com/QAA-Tools/skills
-metadata: {"clawdbot":{"emoji":"🐍","requires":{"env":["PYTHON"]},"primaryEnv":"PYTHON"}}
+metadata:
+  clawdbot:
+    emoji: "🐍"
+    requires:
+      env: [PYTHON]
+    primaryEnv: PYTHON
 ---
 
 # Python Environment Setup

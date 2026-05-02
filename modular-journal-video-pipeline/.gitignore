@@ -1,1 +1,4 @@
 config/local.env.sh
+scripts/__pycache__/
+tests/__pycache__/
+.pytest_cache/
