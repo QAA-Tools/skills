@@ -28,8 +28,106 @@ sys.modules.setdefault("gi.repository", repository)
 sys.modules.setdefault("cairo", types.ModuleType("cairo"))
 
 import prl_llm_core  # noqa: E402
+import prl_rss_extract  # noqa: E402
 import render_prl  # noqa: E402
 import render_prl_bilibili_cover  # noqa: E402
+
+
+def test_build_item_stub_extracts_rss_authors_from_dc_creator():
+    item_xml = """
+    <item>
+      <title>Test Paper</title>
+      <link>http://example.com/paper</link>
+      <prism:doi>10.1103/test-doi</prism:doi>
+      <dc:creator>I. V. Tokatly, Yao Lu, and F. Sebastian Bergeret</dc:creator>
+      <dc:date>2026-05-14T10:00:00+00:00</dc:date>
+      <content:encoded><![CDATA[<p>Author(s): I. V. Tokatly, Yao Lu, and F. Sebastian Bergeret</p><p>Abstract text.</p>]]></content:encoded>
+    </item>
+    """
+
+    stub = prl_rss_extract.build_item_stub(item_xml)
+
+    assert stub["author_text"] == "I. V. Tokatly, Yao Lu, and F. Sebastian Bergeret"
+    assert stub["authors"] == ["I. V. Tokatly", "Yao Lu", "F. Sebastian Bergeret"]
+    assert stub["first_author"] == "I. V. Tokatly"
+
+
+
+def test_build_item_stub_keeps_only_text_inside_escaped_xml_author_tags():
+    item_xml = """
+    <item>
+      <title>Tagged Author Paper</title>
+      <link>http://example.com/paper</link>
+      <prism:doi>10.1103/test-tagged-doi</prism:doi>
+      <dc:creator>&lt;string&gt;A. Author&lt;/string&gt;, &lt;string&gt;B. Author&lt;/string&gt; and &lt;string&gt;C. Author&lt;/string&gt;</dc:creator>
+      <dc:date>2026-05-14T10:00:00+00:00</dc:date>
+      <content:encoded><![CDATA[<p>Abstract text.</p>]]></content:encoded>
+    </item>
+    """
+
+    stub = prl_rss_extract.build_item_stub(item_xml)
+
+    assert stub["author_text"] == "A. Author, B. Author and C. Author"
+    assert stub["authors"] == ["A. Author", "B. Author", "C. Author"]
+    assert stub["first_author"] == "A. Author"
+
+
+
+def test_fake_fill_from_raw_preserves_author_fields():
+    raw = {
+        "date": "2026-04-30",
+        "items": [
+            {
+                "title_en": "Test Title",
+                "doi": "10.1103/test-doi",
+                "abstract_en": "A valid abstract.",
+                "authors": ["A Author", "B Author"],
+                "first_author": "A Author",
+                "author_text": "A Author and B Author",
+            }
+        ],
+    }
+
+    result = prl_llm_core.fake_fill_from_raw(raw, selected_n=1, other_n=0)
+
+    assert result["papers"][0]["authors"] == ["A Author", "B Author"]
+    assert result["papers"][0]["first_author"] == "A Author"
+    assert result["papers"][0]["author_text"] == "A Author and B Author"
+
+
+
+def test_api_fill_from_raw_preserves_author_fields(monkeypatch):
+    raw = {
+        "date": "2026-04-30",
+        "items": [
+            {
+                "title_en": "Test Title",
+                "doi": "10.1103/test-doi",
+                "abstract_en": "A valid abstract.",
+                "authors": ["A Author", "B Author"],
+                "first_author": "A Author",
+                "author_text": "A Author and B Author",
+            }
+        ],
+    }
+
+    def fake_request(prompt, validator, *, label, paper_title_en, doi):
+        if label.startswith("page:"):
+            return {"key_points": ["甲。", "乙。", "丙。"]}
+        if label.startswith("voice:"):
+            return {"title_zh": "", "voice_intro": "一句简介。", "voice_points": ["补充句。"]}
+        if label.startswith("title:"):
+            return {"title_zh": "测试标题"}
+        raise AssertionError(label)
+
+    monkeypatch.setattr(prl_llm_core, "request_json_with_retry", fake_request)
+
+    result = prl_llm_core.api_fill_from_raw(raw, selected_n=1, other_n=0)
+
+    assert result["papers"][0]["authors"] == ["A Author", "B Author"]
+    assert result["papers"][0]["first_author"] == "A Author"
+    assert result["papers"][0]["author_text"] == "A Author and B Author"
+
 
 
 def test_api_fill_from_raw_does_not_fallback_title_translation(monkeypatch):
@@ -77,6 +175,24 @@ def test_normalize_paper_payload_does_not_invent_content_from_placeholders():
     assert normalized["brief"] == ""
     assert normalized["voice_intro"] == ""
     assert normalized["key_points"] == []
+    assert normalized["author_text"] == ""
+
+
+
+def test_normalize_paper_payload_preserves_rss_author_text_except_space_squeeze():
+    raw_author_text = "  A. Author,   B. Author and   C. Author  "
+    normalized = render_prl.normalize_paper_payload(
+        {
+            "title_en": "Author Paper",
+            "brief": "一句简介。",
+            "key_points": ["甲。", "乙。", "丙。"],
+            "author_text": raw_author_text,
+            "doi": "10.1103/test-doi",
+        }
+    )
+
+    assert normalized["author_text"] == "A. Author, B. Author and C. Author"
+
 
 
 def test_paper_voice_parts_does_not_fallback_to_legacy_fields():
@@ -187,10 +303,10 @@ def test_build_page_prompt_prefers_plain_text_lines_not_structured_output():
         }
     )
 
-    assert "直接返回 4~6 行正文" in prompt
+    assert "总共返回 4~6 行，每行正好 1 句中文" in prompt
     assert "返回结构：" not in prompt
     assert "只返回 JSON" not in prompt
-    assert "json" not in prompt.lower()
+    assert "不要返回 JSON" in prompt
 
 
 
@@ -297,7 +413,8 @@ def test_cover_extract_keywords_prefers_comma_separated_tags_file(tmp_path):
 def test_request_json_with_retry_retries_only_failed_call(monkeypatch):
     calls = {"count": 0}
 
-    def fake_call(_prompt):
+    def fake_call(_prompt, *, system_prompt=""):
+        assert system_prompt == "只输出 JSON，不要输出 markdown 或解释。"
         calls["count"] += 1
         if calls["count"] == 1:
             return '{"key_points": ["坏"]}'
@@ -321,7 +438,8 @@ def test_request_json_with_retry_retries_only_failed_call(monkeypatch):
 def test_request_json_with_retry_salvages_plain_text_page_without_retry(monkeypatch):
     calls = {"count": 0}
 
-    def fake_call(_prompt):
+    def fake_call(_prompt, *, system_prompt=""):
+        assert system_prompt == "只输出 JSON，不要输出 markdown 或解释。"
         calls["count"] += 1
         return "甲。乙。丙。丁。"
 
@@ -343,7 +461,8 @@ def test_request_json_with_retry_salvages_plain_text_page_without_retry(monkeypa
 def test_request_json_with_retry_accepts_json_array_page_without_retry(monkeypatch):
     calls = {"count": 0}
 
-    def fake_call(_prompt):
+    def fake_call(_prompt, *, system_prompt=""):
+        assert system_prompt == "只输出 JSON，不要输出 markdown 或解释。"
         calls["count"] += 1
         return '["甲。", "乙。", "丙。"]'
 
@@ -358,4 +477,48 @@ def test_request_json_with_retry_accepts_json_array_page_without_retry(monkeypat
     )
 
     assert result == {"key_points": ["甲。", "乙。", "丙。"]}
+    assert calls["count"] == 1
+
+
+def test_request_text_with_retry_retries_until_validator_accepts(monkeypatch):
+    calls = {"count": 0}
+
+    def fake_call(_prompt, *, system_prompt=""):
+        assert system_prompt == ""
+        calls["count"] += 1
+        return "score=9.5" if calls["count"] == 1 else "9.5"
+
+    monkeypatch.setattr(prl_llm_core, "call_openai_compatible", fake_call)
+
+    result = prl_llm_core.request_text_with_retry(
+        "dummy prompt",
+        lambda text: float(text) if text.strip().replace('.', '', 1).isdigit() else None,
+        label="score:test",
+        paper_title_en="Test Title",
+        doi="10.1103/test-doi",
+    )
+
+    assert result == 9.5
+    assert calls["count"] == 2
+
+
+def test_request_text_with_retry_accepts_pure_number_without_retry(monkeypatch):
+    calls = {"count": 0}
+
+    def fake_call(_prompt, *, system_prompt=""):
+        assert system_prompt == ""
+        calls["count"] += 1
+        return "8.7"
+
+    monkeypatch.setattr(prl_llm_core, "call_openai_compatible", fake_call)
+
+    result = prl_llm_core.request_text_with_retry(
+        "dummy prompt",
+        lambda text: float(text) if text.strip().replace('.', '', 1).isdigit() else None,
+        label="score:test",
+        paper_title_en="Test Title",
+        doi="10.1103/test-doi",
+    )
+
+    assert result == 8.7
     assert calls["count"] == 1

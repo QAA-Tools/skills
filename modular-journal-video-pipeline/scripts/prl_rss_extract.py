@@ -285,11 +285,24 @@ def choose_best_abstract_from_openalex(title_en: str, doi: str) -> dict:
     }
 
 
+def parse_rss_authors(creator_text: str) -> List[str]:
+    text = normalize_spaces(strip_tags(html.unescape(creator_text or "")))
+    if not text:
+        return []
+    text = re.sub(r"\s*,\s*and\s+", ", ", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s+and\s+", ", ", text, flags=re.IGNORECASE)
+    parts = [normalize_spaces(x) for x in text.split(",")]
+    return [x for x in parts if x]
+
+
+
 def build_item_stub(item_xml: str) -> Dict:
     title = latex_to_plain_text(strip_tags(get_tag(item_xml, "title")))
     doi = html.unescape(strip_tags(get_tag(item_xml, "prism:doi")))
     link = html.unescape(strip_tags(get_tag(item_xml, "link")))
     rss_date = html.unescape(strip_tags(get_tag(item_xml, "dc:date")))
+    creator_text = normalize_spaces(strip_tags(html.unescape(get_tag(item_xml, "dc:creator"))))
+    authors = parse_rss_authors(creator_text)
     rss_snippet = extract_abstract_from_encoded(item_xml)
 
     return {
@@ -297,6 +310,9 @@ def build_item_stub(item_xml: str) -> Dict:
         "doi": doi,
         "link": link,
         "rss_date": rss_date,
+        "author_text": creator_text,
+        "authors": authors,
+        "first_author": authors[0] if authors else "",
         "rss_snippet": rss_snippet,
         "rss_snippet_truncated": looks_truncated(rss_snippet),
     }

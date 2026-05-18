@@ -298,6 +298,8 @@ def normalize_paper_payload(p: dict) -> dict:
     if doi and not re.match(r"^10\.1103/\S+$", doi):
         doi = ""
 
+    author_text = squeeze_spaces(p.get("author_text") or "")
+
     voice_intro_raw = clean_point(p.get("voice_intro") or "")
     voice_intro = "" if looks_like_placeholder(voice_intro_raw) else voice_intro_raw
     if not brief:
@@ -313,6 +315,7 @@ def normalize_paper_payload(p: dict) -> dict:
         "brief": brief,
         "key_points": key_points,
         "doi": doi,
+        "author_text": author_text,
         "voice_intro": voice_intro,
         "voice_points": voice_points,
     }
@@ -663,6 +666,23 @@ def render_paper(p: dict, out_path: Path):
         title_font = ImageFont.truetype(FONT_BOLD_PATH, 26)
         title_lines = wrap_text(d, paper["title_en"].replace("-", "‑"), title_font, inner_w)
 
+    author_lines: List[str] = []
+    author_font = None
+    for size in (18, 17, 16, 15):
+        candidate_font = ImageFont.truetype(FONT_REG_PATH, size)
+        candidate_lines = wrap_text(d, paper["author_text"], candidate_font, inner_w)
+        if not candidate_lines:
+            candidate_lines = [""]
+        if len(candidate_lines) <= 4:
+            author_font = candidate_font
+            author_lines = candidate_lines
+            break
+    if not author_lines:
+        author_font = ImageFont.truetype(FONT_REG_PATH, 15)
+        author_lines = wrap_text(d, paper["author_text"], author_font, inner_w)
+        if not author_lines:
+            author_lines = [""]
+
     brief_lines: List[str] = []
     brief_font = None
     for size in (20, 19, 18, 17):
@@ -677,9 +697,10 @@ def render_paper(p: dict, out_path: Path):
         brief_lines = wrap_text(d, paper["brief"], brief_font, inner_w)[:3]
 
     title_step = max(38, int(title_font.size * 1.18))
+    author_step = max(26, int(author_font.size * 1.45))
     brief_step = max(34, int(brief_font.size * 1.55))
-    hero_h = 34 + title_step * len(title_lines) + 14 + brief_step * max(len(brief_lines), 1) + 30
-    hero_h = max(248, min(hero_h, 352))
+    hero_h = 34 + title_step * len(title_lines) + 16 + author_step * max(len(author_lines), 1) + 12 + brief_step * max(len(brief_lines), 1) + 30
+    hero_h = max(268, min(hero_h, 420))
     hero = (hero_x1, hero_y1, hero_x2, hero_y1 + hero_h)
     draw_round_rect(d, hero, fill=CARD, outline=(214, 223, 240), radius=34, width=2)
     hero_y2 = hero[3]
@@ -689,7 +710,12 @@ def render_paper(p: dict, out_path: Path):
         draw_text_pango(img, ln, inner_x, y, font=title_font, color=FG, max_width=inner_w)
         y += title_step
 
-    y += 22
+    y += 16
+    for ln in author_lines:
+        draw_text_pango(img, ln, inner_x, y, font=author_font, color=MUTED, max_width=inner_w)
+        y += author_step
+
+    y += 12
     for ln in brief_lines:
         draw_text_pango(img, ln, inner_x, y, font=brief_font, color=FG, max_width=inner_w)
         y += brief_step

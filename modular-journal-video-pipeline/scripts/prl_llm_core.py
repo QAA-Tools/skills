@@ -30,6 +30,8 @@ import urllib.request
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+from runtime_logger import log_runtime_event
+
 import prl_rss_extract as rss_extract
 
 
@@ -533,6 +535,9 @@ def fake_fill_from_raw(raw: dict, selected_n: int, other_n: int = 10) -> dict:
                 "title_en": title_en,
                 "title_zh": title_zh,
                 "doi": doi,
+                "authors": list(it.get("authors") or []),
+                "first_author": (it.get("first_author") or "").strip(),
+                "author_text": (it.get("author_text") or "").strip(),
                 "brief": brief,
                 "key_points": key_points,
                 "method_results": method_results,
@@ -556,20 +561,20 @@ def fake_fill_from_raw(raw: dict, selected_n: int, other_n: int = 10) -> dict:
     return {"date": raw.get("date"), **issue_meta_from_raw(raw), "papers": papers, "other_papers": other_papers}
 
 
-def call_openai_compatible(prompt: str) -> str:
+def call_openai_compatible(prompt: str, *, system_prompt: str = "") -> str:
     api_key = os.environ.get("OPENAI_API_KEY", "")
     base_url = os.environ.get("OPENAI_BASE_URL", "")
-    model = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+    model = os.environ.get("OPENAI_MODEL", "gpt-5.5")
     if not api_key or not base_url:
         raise RuntimeError("OPENAI_API_KEY or OPENAI_BASE_URL missing")
 
     url = base_url.rstrip("/") + "/chat/completions"
+    messages = [{"role": "user", "content": prompt}]
+    if system_prompt:
+        messages.insert(0, {"role": "system", "content": system_prompt})
     payload = {
         "model": model,
-        "messages": [
-            {"role": "system", "content": "只输出 JSON，不要输出 markdown 或解释。"},
-            {"role": "user", "content": prompt},
-        ],
+        "messages": messages,
         "temperature": 0.7,
     }
     req = urllib.request.Request(
@@ -716,21 +721,20 @@ def log_api_event(*, paper_title_en: str, doi: str, stage: str, attempt: int, st
     path = current_api_debug_log_path()
     if path is None:
         return
-    path.parent.mkdir(parents=True, exist_ok=True)
-    record = {
-        "ts": dt.datetime.now(ZoneInfo("Asia/Shanghai")).isoformat(timespec="seconds"),
-        "paper_title_en": paper_title_en,
-        "doi": doi,
-        "stage": stage,
-        "attempt": attempt,
-        "status": status,
-        "error_type": error_type,
-        "validator_reason": validator_reason,
-        "raw_preview": raw_preview,
-        "parsed_preview": parsed_preview,
-    }
-    with path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    log_runtime_event(
+        path,
+        source="llm_api",
+        event=stage,
+        status=status,
+        paper_title_en=paper_title_en,
+        doi=doi,
+        stage=stage,
+        attempt=attempt,
+        error_type=error_type,
+        validator_reason=validator_reason,
+        raw_preview=raw_preview,
+        parsed_preview=parsed_preview,
+    )
 
 
 def explain_page_payload_failure(data) -> str:
@@ -905,8 +909,17 @@ def detect_quality_warning(stage: str, validated: dict) -> str:
 def request_json_with_retry(prompt: str, validator, *, label: str, paper_title_en: str, doi: str) -> dict | None:
     stage = label.split(":", 1)[0].strip() or "unknown"
     for attempt in range(1, 3):
+        log_api_event(
+            paper_title_en=paper_title_en,
+            doi=doi,
+            stage=stage,
+            attempt=attempt,
+            status="request_started",
+        )
         try:
-            raw_output = strip_code_fences(call_openai_compatible(prompt)).strip()
+            raw_output = strip_code_fences(
+                call_openai_compatible(prompt, system_prompt="只输出 JSON，不要输出 markdown 或解释。")
+            ).strip()
             try:
                 parsed = json.loads(raw_output)
                 parsed_from_json = True
@@ -981,27 +994,98 @@ def request_json_with_retry(prompt: str, validator, *, label: str, paper_title_e
     return None
 
 
+def request_text_with_retry(prompt: str, validator, *, label: str, paper_title_en: str, doi: str):
+    stage = label.split(":", 1)[0].strip() or "unknown"
+    for attempt in range(1, 3):
+        log_api_event(
+            paper_title_en=paper_title_en,
+            doi=doi,
+            stage=stage,
+            attempt=attempt,
+            status="request_started",
+        )
+        try:
+            raw_output = strip_code_fences(call_openai_compatible(prompt)).strip()
+        except (urllib.error.URLError, TimeoutError):
+            log_api_event(
+                paper_title_en=paper_title_en,
+                doi=doi,
+                stage=stage,
+                attempt=attempt,
+                status="network_error",
+                error_type="URLError_or_TimeoutError",
+            )
+            if attempt < 2:
+                time.sleep(10)
+                continue
+            return None
+        except (RuntimeError, KeyError, ValueError) as e:
+            log_api_event(
+                paper_title_en=paper_title_en,
+                doi=doi,
+                stage=stage,
+                attempt=attempt,
+                status="runtime_error",
+                error_type=type(e).__name__,
+            )
+            if attempt < 2:
+                continue
+            return None
+
+        validated = validator(raw_output)
+        if validated is not None:
+            log_api_event(
+                paper_title_en=paper_title_en,
+                doi=doi,
+                stage=stage,
+                attempt=attempt,
+                status="success",
+                error_type="raw_text",
+                raw_preview=preview_value(raw_output),
+                parsed_preview=preview_value(validated),
+            )
+            return validated
+        log_api_event(
+            paper_title_en=paper_title_en,
+            doi=doi,
+            stage=stage,
+            attempt=attempt,
+            status="validation_failed",
+            error_type="raw_text",
+            validator_reason="text_validator_rejected",
+            raw_preview=preview_value(raw_output),
+            parsed_preview=preview_value(raw_output),
+        )
+        if attempt < 2:
+            continue
+    return None
+
+
 def build_page_copy_prompt(item: dict) -> str:
     title_en = normalize_formula_text((item.get("title_en") or "").strip())
     abstract_en = squeeze_spaces((item.get("abstract_en") or "").strip())
     return (
         "任务：为 PRL 单篇精读页生成关键要点文案。\n"
-        "要求：\n"
-        "1. 直接返回 4~6 行正文，每行 1 条中文要点。\n"
-        "2. 每条都必须是完整句子。\n"
-        "3. 这些要点合在一起，应自然覆盖这篇工作的研究对象、采用的方法或关键设定、直接结果，以及最值得记住的物理含义、适用范围或限制。\n"
-        "4. 不要机械区分方法和结论，只按自然叙述顺序组织内容。\n"
-        "5. 每条尽量只表达一个清晰信息点，避免一句话里塞太多层次。\n"
-        "6. 直接写具体内容，不要写成提纲腔、导读腔或总结腔。\n"
-        "7. 只用自然中文表达；能直接写清楚就直接写清楚，不要故意夹英文短语。\n"
-        "8. 化学式保持原写法，不要改写成中文名称。\n"
-        "9. 遇到化学式、特殊符号、变量名、群记号或公式时，统一用行内 LaTeX 形式写成 $...$，不要输出 Unicode 数学花体字母、上标下标异体字或其他花哨符号。\n"
-        "10. 例如：把 𝓕 写成 $\\mathscr{F}$，把 L_𝓕U(1) 写成 $L_{\\mathscr{F}}U(1)$，把 f(k) 写成 $f(k)$。\n"
-        "11. 只根据标题和摘要写，不补充摘要里没有的信息。\n"
-        "12. 宁可少写一点，也不要为了凑条数写空话、套话或重复句。\n"
-        "13. 除这几行要点外，不要写标题、编号、前言、结语或解释。\n"
+        "输出格式要求（必须严格遵守）：\n"
+        "1. 只返回纯文本，不要返回 JSON、列表、Markdown、代码块或任何字段名。\n"
+        "2. 总共返回 4~6 行，每行正好 1 句中文。\n"
+        "3. 每行都必须以中文句号‘。’结尾。\n"
+        "4. 不要写序号、项目符号、引号、括号说明、前言、结语或任何额外内容。\n"
+        "5. 不要出现 points、key_points、bullets、items 等字样。\n"
+        "6. 如果拿不准，也只返回纯文本句子，不要包装成任何结构。\n"
+        "内容要求：\n"
+        "7. 这些句子合在一起，应自然覆盖这篇工作的研究对象、采用的方法或关键设定、直接结果，以及最值得记住的物理含义、适用范围或限制。\n"
+        "8. 不要机械区分方法和结论，只按自然叙述顺序组织内容。\n"
+        "9. 每句尽量只表达一个清晰信息点，避免一句话里塞太多层次。\n"
+        "10. 直接写具体内容，不要写成提纲腔、导读腔或总结腔。\n"
+        "11. 只用自然中文表达；能直接写清楚就直接写清楚，不要故意夹英文短语。\n"
+        "12. 化学式保持原写法，不要改写成中文名称。\n"
+        "13. 遇到化学式、特殊符号、变量名、群记号或公式时，统一用行内 LaTeX 形式写成 $...$，不要输出 Unicode 数学花体字母、上标下标异体字或其他花哨符号。\n"
+        "14. 例如：把 𝓕 写成 $\\mathscr{F}$，把 L_𝓕U(1) 写成 $L_{\\mathscr{F}}U(1)$，把 f(k) 写成 $f(k)$。\n"
+        "15. 只根据标题和摘要写，不补充摘要里没有的信息。\n"
+        "16. 宁可少写一点，也不要为了凑条数写空话、套话或重复句。\n"
         "禁止出现的开头或套话：这项工作、该工作、本文、作者、研究对象是、重点考察、核心在于、结论是、其意义在于、结果表明、进一步表明、值得注意的是、可以看出。\n"
-        "补充要求：每条都要能单独读通，不能是残句、半句或从句；不要先写空泛判断，再补内容；如果摘要本身没有给出意义或限制，可以不单独硬写这一类句子。\n"
+        "补充要求：每句都要能单独读通，不能是残句、半句或从句；不要先写空泛判断，再补内容；如果摘要本身没有给出意义或限制，可以不单独硬写这一类句子。\n"
         f"title_en: {json.dumps(title_en, ensure_ascii=False)}\n"
         f"abstract_en: {json.dumps(abstract_en, ensure_ascii=False)}"
     )
@@ -1086,6 +1170,9 @@ def api_fill_from_raw(raw: dict, selected_n: int, other_n: int = 10) -> dict:
                 "title_en": title_en,
                 "title_zh": title_payload["title_zh"],
                 "doi": doi,
+                "authors": list(it.get("authors") or []),
+                "first_author": (it.get("first_author") or "").strip(),
+                "author_text": (it.get("author_text") or "").strip(),
                 "brief": voice_payload["voice_intro"],
                 "key_points": page_payload["key_points"],
                 "voice_intro": voice_payload["voice_intro"],

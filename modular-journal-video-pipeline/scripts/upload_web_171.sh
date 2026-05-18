@@ -8,6 +8,10 @@ set -euo pipefail
 # Credentials are referenced by file path ONLY.
 
 LOGIN_FILE="${BILI_LOGIN_FILE:-/home/cndaqiang/work/hermes/workspace/bilibili/.secrets/bili_logininfo.json}"
+BILIUP_BIN="${BILIUP_BIN:-}"
+if [[ -z "$BILIUP_BIN" ]]; then
+  BILIUP_BIN="$(command -v biliup || true)"
+fi
 
 usage() {
   cat <<'EOF'
@@ -71,7 +75,12 @@ if [[ "$COPYRIGHT" == "2" && -z "$SOURCE" ]]; then
   exit 2
 fi
 
-CMD=(biliup -u "$LOGIN_FILE" upload --submit web --tid 171 --copyright "$COPYRIGHT" --title "$TITLE")
+if [[ -z "$BILIUP_BIN" || ! -x "$BILIUP_BIN" ]]; then
+  echo "biliup not found. Set BILIUP_BIN or add biliup to PATH." >&2
+  exit 127
+fi
+
+CMD=("$BILIUP_BIN" -u "$LOGIN_FILE" upload --submit web --tid 171 --copyright "$COPYRIGHT" --title "$TITLE")
 
 [[ -n "$DESC" ]] && CMD+=(--desc "$DESC")
 [[ -n "$TAG" ]] && CMD+=(--tag "$TAG")
