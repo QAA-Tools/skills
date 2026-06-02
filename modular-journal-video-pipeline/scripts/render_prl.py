@@ -538,8 +538,8 @@ def render_cover(date: str, titles: List[str], dois: List[str], out_path: Path, 
     draw_gradient_bg(img, seed=seed_from_text(date + "|cover"))
     d = ImageDraw.Draw(img)
 
-    hero = (MARGIN_X, 72, W - MARGIN_X, 356)
-    draw_round_rect(d, hero, fill=CARD, outline=(214, 223, 240), radius=36, width=2)
+    hero = (MARGIN_X, TOP_Y, W - MARGIN_X, 378)
+    draw_round_rect(d, hero, fill=CARD, outline=OUTLINE, radius=34, width=2)
 
     hero_x1, hero_y1, hero_x2, hero_y2 = hero
     pad_x = 20
@@ -551,6 +551,7 @@ def render_cover(date: str, titles: List[str], dois: List[str], out_path: Path, 
     title_font = ImageFont.truetype(FONT_BOLD_PATH, 42)
     title_y = hero_y1 + 94
     title_lines = wrap_text(d, cover_title, title_font, inner_w)
+
     for ln in title_lines[:2]:
         d.text((inner_x, title_y), ln, fill=FG, font=title_font)
         title_y += 52

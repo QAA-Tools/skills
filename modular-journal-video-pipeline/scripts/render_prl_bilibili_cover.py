@@ -8,9 +8,12 @@ Usage:
 """
 
 import argparse
+import datetime as dt
+import io
 import json
 import random
 import re
+import urllib.request
 from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
@@ -186,30 +189,165 @@ def extract_keywords(input_json: str, *, tags_file: str = "", limit: int = 7):
     return keywords[:limit]
 
 
+def boxes_overlap(a, b, *, pad: int = 10) -> bool:
+    return not (
+        a[2] + pad <= b[0]
+        or b[2] + pad <= a[0]
+        or a[3] + pad <= b[1]
+        or b[3] + pad <= a[1]
+    )
+
+
 def draw_keyword_cloud(draw: ImageDraw.ImageDraw, keywords, seed: int):
     rnd = random.Random(seed)
-    fonts = [
-        ImageFont.truetype(FONT_REG_PATH, 28),
-        ImageFont.truetype(FONT_REG_PATH, 32),
-        ImageFont.truetype(FONT_BOLD_PATH, 30),
-    ]
-    anchors = [
-        (170, 700), (360, 760), (560, 700), (250, 840),
-        (470, 880), (700, 780), (820, 860), (930, 720),
-    ]
+    font = ImageFont.truetype(FONT_REG_PATH, 54)
     colors = [
-        (93, 91, 255, 150),
-        (0, 184, 163, 138),
-        (122, 91, 255, 120),
-        (99, 111, 129, 110),
+        (93, 91, 255, 138),
+        (0, 184, 163, 130),
+        (122, 91, 255, 128),
+        (74, 88, 112, 124),
     ]
+
+    # Stable rows, but each row gets different loose x slots. This avoids the
+    # "all rows line up vertically" look while keeping row spacing controlled.
+    row_ys = [500, 590, 680, 770]
+    row_slot_patterns = [
+        [(230, 430), (650, 1085)],
+        [(380, 610), (760, 1085)],
+        [(250, 520), (570, 875)],
+        [(455, 720), (820, 1095)],
+    ]
+    min_gap = 38
+    placed = []
+
     for i, kw in enumerate(keywords):
-        x, y = anchors[i % len(anchors)]
-        x += rnd.randint(-24, 24)
-        y += rnd.randint(-18, 18)
-        font = fonts[i % len(fonts)]
-        color = colors[i % len(colors)]
-        draw.text((x, y), kw, fill=color, font=font)
+        bbox = draw.textbbox((0, 0), kw, font=font)
+        text_w = bbox[2] - bbox[0]
+        text_h = bbox[3] - bbox[1]
+        if text_w <= 0 or text_h <= 0:
+            continue
+        row_idx = (i // 2) % len(row_ys)
+        slot_idx = i % 2
+        slot_left, slot_right = row_slot_patterns[row_idx][slot_idx]
+        max_x = max(slot_left, slot_right - text_w)
+        preferred_y = row_ys[row_idx]
+
+        candidates = []
+        for _ in range(90):
+            x = rnd.randint(slot_left, max_x)
+            y = preferred_y + rnd.randint(-6, 6)
+            box = (x, y, x + text_w, y + text_h)
+            conflicts = sum(1 for p in placed if boxes_overlap(box, p["box"], pad=min_gap))
+            crowd_penalty = 0
+            vertical_alignment_penalty = 0
+            for p in placed:
+                px1, py1, px2, py2 = p["box"]
+                pc = (px1 + px2) / 2
+                c = (box[0] + box[2]) / 2
+                if not (box[3] + min_gap <= py1 or py2 + min_gap <= box[1]):
+                    crowd_penalty += max(0, min(box[2], px2) - max(box[0], px1) + min_gap)
+                # Penalize repeated x-centers across rows; this is what made
+                # the previous two-lane layout look insufficiently random.
+                if abs(c - pc) < 120:
+                    vertical_alignment_penalty += 120 - abs(c - pc)
+            candidates.append((conflicts, crowd_penalty + vertical_alignment_penalty * 0.8 + abs(y - preferred_y), x, y, box))
+
+        candidates.sort(key=lambda c: (c[0], c[1]))
+        _, _, x, y, box = candidates[0]
+
+        for _ in range(18):
+            conflicts = [p for p in placed if boxes_overlap(box, p["box"], pad=min_gap)]
+            if not conflicts:
+                break
+            nearest = min(conflicts, key=lambda p: abs((box[0] + box[2]) / 2 - (p["box"][0] + p["box"][2]) / 2))
+            shift = 26 if (box[0] + box[2]) >= (nearest["box"][0] + nearest["box"][2]) else -26
+            x = max(slot_left, min(max_x, x + shift))
+            box = (x, y, x + text_w, y + text_h)
+            if x in {slot_left, max_x}:
+                break
+
+        draw.text((x - bbox[0], y - bbox[1]), kw, fill=colors[i % len(colors)], font=font)
+        placed.append({"box": box, "text": kw})
+
+
+def parse_date_key(value: str) -> dt.date | None:
+    value = (value or "").strip()
+    if not value:
+        return None
+    try:
+        return dt.datetime.strptime(value[:10], "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+
+def rss_dates_are_stale(data: dict, local_date: str, *, stale_days: int = 3) -> bool:
+    local = parse_date_key(local_date or data.get("date") or "")
+    if local is None:
+        return False
+    dates = [
+        parse_date_key(data.get("feed_date_condensed") or data.get("target_date_condensed") or ""),
+        parse_date_key(data.get("feed_date_recent") or data.get("target_date_recent") or ""),
+    ]
+    dates = [d for d in dates if d is not None]
+    if not dates:
+        paper_dates = [parse_date_key(p.get("rss_date") or "") for p in (data.get("papers") or [])]
+        dates = [d for d in paper_dates if d is not None]
+    return bool(dates) and all((local - d).days > stale_days for d in dates)
+
+
+def choose_cover_image_url(input_json: str, *, paper_limit: int = 2, local_date: str = "") -> str:
+    if not input_json:
+        return ""
+    try:
+        data = json.loads(Path(input_json).read_text(encoding="utf-8"))
+    except Exception:
+        return ""
+    papers = list(data.get("papers") or [])
+    candidates = [(paper.get("rss_cover_image") or "").strip() for paper in papers if (paper.get("rss_cover_image") or "").strip()]
+    if not candidates:
+        return ""
+    if rss_dates_are_stale(data, local_date or data.get("date") or ""):
+        seed_text = f"{local_date or data.get('date') or ''}|stale-rss-cover|" + "|".join(candidates)
+        return random.Random(seed_from_text(seed_text)).choice(candidates)
+    for url in candidates[: max(0, paper_limit)]:
+        if url:
+            return url
+    return candidates[0]
+
+
+def load_cover_image(input_json: str, *, timeout: int = 12, local_date: str = "") -> Image.Image | None:
+    image_url = choose_cover_image_url(input_json, local_date=local_date)
+    if not image_url:
+        return None
+    opener = urllib.request.build_opener()
+    opener.addheaders = [("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36")]
+    try:
+        with opener.open(image_url, timeout=timeout) as resp:
+            raw = resp.read()
+        return Image.open(io.BytesIO(raw)).convert("RGBA")
+    except Exception:
+        return None
+
+
+def paste_cover_image(img: Image.Image, art: Image.Image, box) -> None:
+    x1, y1, x2, y2 = box
+    box_w = max(1, x2 - x1)
+    box_h = max(1, y2 - y1)
+    src_w, src_h = art.size
+    if src_w <= 0 or src_h <= 0:
+        return
+    resampling = getattr(Image, "Resampling", Image)
+    lanczos = getattr(resampling, "LANCZOS", getattr(Image, "LANCZOS", 1))
+    scale = max(box_w / src_w, box_h / src_h) * 1.18
+    resized = art.resize((max(1, int(src_w * scale)), max(1, int(src_h * scale))), lanczos)
+    left = max(0, (resized.width - box_w) // 2)
+    top = max(0, (resized.height - box_h) // 2)
+    cropped = resized.crop((left, top, left + box_w, top + box_h))
+    mask = Image.new("L", (box_w, box_h), 0)
+    ImageDraw.Draw(mask).rounded_rectangle((0, 0, box_w, box_h), radius=40, fill=255)
+    panel = Image.new("RGBA", (box_w, box_h), (255, 255, 255, 0))
+    panel.alpha_composite(cropped, (0, 0))
+    img.paste(panel, (x1, y1), mask)
 
 
 def draw_orbit_motif(draw: ImageDraw.ImageDraw):
@@ -241,20 +379,27 @@ def render_cover(date: str, out_path: Path, title: str = "", input_json: str = "
     title_font = ImageFont.truetype(FONT_BOLD_PATH, 128)
     date_font = ImageFont.truetype(FONT_BOLD_PATH, 58)
     x1, y1, x2, y2 = main_card
-    left_x = x1 + 58
-    left_w = 980
+    left_x = x1 + 182
+    left_w = 760
 
     draw_chip(d, "PHYSICAL REVIEW LETTERS", left_x, y1 + 52, chip_font)
 
     title = resolve_cover_title(input_json, title)
-    title_y = y1 + 190
+    title_y = y1 + 145
     for line in wrap_text(d, title, title_font, left_w)[:2]:
         d.text((left_x, title_y), line, fill=FG, font=title_font)
         title_y += 140
 
     d.text((left_x, title_y + 6), date.replace('-', '.'), fill=ACCENT_3, font=date_font)
     draw_keyword_cloud(d, extract_keywords(input_json, tags_file=tags_file), seed=seed + 17)
-    draw_orbit_motif(d)
+
+    image_box = (1200, 175, 1780, 885)
+    d.rounded_rectangle(image_box, radius=46, fill=(244, 247, 255), outline=(220, 227, 241), width=3)
+    cover_image = load_cover_image(input_json, local_date=date)
+    if cover_image is not None:
+        paste_cover_image(img, cover_image, image_box)
+    else:
+        draw_orbit_motif(d)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     img.convert("RGB").save(out_path, format="PNG", quality=95)

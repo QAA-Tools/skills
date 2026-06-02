@@ -122,21 +122,47 @@ def build_daily_raw(selected_n: int, recent_n: int = 25, days_ago: int = 0) -> d
     }
 
 
+def issue_composition_from_raw(raw: dict) -> dict:
+    feed_date_condensed = (raw.get("feed_date_condensed") or raw.get("target_date_condensed") or "").strip()
+    feed_date_recent = (raw.get("feed_date_recent") or raw.get("target_date_recent") or "").strip()
+    condensed_count = int(raw.get("item_count_today_condensed", 0) or 0)
+    recent_count = int(raw.get("item_count_today_recent", 0) or 0)
+    if condensed_count and recent_count:
+        summary = f"本次凝聚态 {condensed_count} 篇（{feed_date_condensed}），其他 PRL 方向补充 {recent_count} 篇（{feed_date_recent}）。"
+    elif condensed_count:
+        summary = f"本次凝聚态 {condensed_count} 篇（{feed_date_condensed}）。"
+    elif recent_count:
+        summary = f"本次其他 PRL 方向补充 {recent_count} 篇（{feed_date_recent}）。"
+    else:
+        summary = ""
+    return {
+        "feed_date_condensed": feed_date_condensed,
+        "feed_date_recent": feed_date_recent,
+        "item_count_today_condensed": condensed_count,
+        "item_count_today_recent": recent_count,
+        "issue_composition_summary": summary,
+    }
+
+
 def issue_meta_from_raw(raw: dict) -> dict:
     days_ago = max(0, int(raw.get("days_ago", 0) or 0))
+    composition = issue_composition_from_raw(raw)
+    subtitle_tail = composition.get("issue_composition_summary") or ("本周凝聚态热点" if days_ago >= 7 else "今日热点")
     if days_ago >= 7:
         return {
+            **composition,
             "issue_mode": "weekly",
             "video_title": "PRL本周凝聚态热点",
             "cover_title": "PRL本周凝聚态热点",
-            "cover_subtitle": f'{raw.get("date", "")} · 本周凝聚态热点',
+            "cover_subtitle": subtitle_tail,
             "section_label": "本期精讲",
         }
     return {
+        **composition,
         "issue_mode": "daily",
         "video_title": "PRL今日热点",
         "cover_title": "PRL今日热点",
-        "cover_subtitle": f'{raw.get("date", "")} · 今日热点',
+        "cover_subtitle": subtitle_tail,
         "section_label": "今日精讲",
     }
 
@@ -144,21 +170,14 @@ def issue_meta_from_raw(raw: dict) -> dict:
 def build_publish_desc(data: dict, raw: dict, *, max_titles: int = 5) -> str:
     del data, max_titles
     parts = []
-    feed_date_condensed = (raw.get("feed_date_condensed") or raw.get("target_date_condensed") or "").strip()
-    feed_date_recent = (raw.get("feed_date_recent") or raw.get("target_date_recent") or "").strip()
+    composition = issue_composition_from_raw(raw)
     model = (os.environ.get("OPENAI_MODEL") or "").strip()
 
     parts.append("数据来源：APS PRL RSS")
-    if feed_date_condensed and feed_date_recent and feed_date_condensed != feed_date_recent:
-        tail = f"论文日期：{feed_date_condensed}/{feed_date_recent}"
-    elif feed_date_condensed or feed_date_recent:
-        tail = f"论文日期：{feed_date_condensed or feed_date_recent}"
-    else:
-        tail = ""
+    if composition.get("issue_composition_summary"):
+        parts.append(composition["issue_composition_summary"])
     if model:
-        tail = f"{tail}｜模型：{model}" if tail else f"模型：{model}"
-    if tail:
-        parts.append(tail)
+        parts.append(f"模型：{model}")
     return "\n".join(parts).strip() + ("\n" if parts else "")
 
 
@@ -535,6 +554,10 @@ def fake_fill_from_raw(raw: dict, selected_n: int, other_n: int = 10) -> dict:
                 "title_en": title_en,
                 "title_zh": title_zh,
                 "doi": doi,
+                "paper_url": (it.get("paper_url") or it.get("link") or "").strip(),
+                "rss_cover_image": (it.get("rss_cover_image") or "").strip(),
+                "rss_date": (it.get("rss_date") or "").strip(),
+                "feed_group": (it.get("feed_group") or "").strip(),
                 "authors": list(it.get("authors") or []),
                 "first_author": (it.get("first_author") or "").strip(),
                 "author_text": (it.get("author_text") or "").strip(),
@@ -555,6 +578,7 @@ def fake_fill_from_raw(raw: dict, selected_n: int, other_n: int = 10) -> dict:
                 "title_en": title_en,
                 "title_zh": "",
                 "doi": (it.get("doi") or "").strip(),
+                "paper_url": (it.get("paper_url") or it.get("link") or "").strip(),
             }
         )
 
@@ -1170,6 +1194,10 @@ def api_fill_from_raw(raw: dict, selected_n: int, other_n: int = 10) -> dict:
                 "title_en": title_en,
                 "title_zh": title_payload["title_zh"],
                 "doi": doi,
+                "paper_url": (it.get("paper_url") or it.get("link") or "").strip(),
+                "rss_cover_image": (it.get("rss_cover_image") or "").strip(),
+                "rss_date": (it.get("rss_date") or "").strip(),
+                "feed_group": (it.get("feed_group") or "").strip(),
                 "authors": list(it.get("authors") or []),
                 "first_author": (it.get("first_author") or "").strip(),
                 "author_text": (it.get("author_text") or "").strip(),
@@ -1191,6 +1219,7 @@ def api_fill_from_raw(raw: dict, selected_n: int, other_n: int = 10) -> dict:
                 "title_en": title_en,
                 "title_zh": "",
                 "doi": (it.get("doi") or "").strip(),
+                "paper_url": (it.get("paper_url") or it.get("link") or "").strip(),
             }
         )
 

@@ -123,6 +123,27 @@ def extract_abstract_from_encoded(item: str) -> str:
     return normalize_spaces(html.unescape(strip_tags(cand)))
 
 
+def extract_cover_image_from_rss_item(item: str) -> str:
+    blobs = [
+        html.unescape(get_tag(item, "description") or ""),
+        html.unescape(get_tag(item, "content:encoded") or ""),
+    ]
+    for blob in blobs:
+        if not blob:
+            continue
+        for match in re.finditer(r'<img[^>]+src=["\']?([^"\' >]+)', blob, flags=re.I):
+            src = normalize_spaces(match.group(1))
+            if not src:
+                continue
+            if src.startswith("//"):
+                src = "https:" + src
+            elif src.startswith("/"):
+                src = "https://journals.aps.org" + src
+            if re.match(r"https?://", src, flags=re.I):
+                return src
+    return ""
+
+
 def date_key_from_rss_date(rss_date: str) -> str:
     return normalize_spaces(rss_date)[:10]
 
@@ -304,6 +325,7 @@ def build_item_stub(item_xml: str) -> Dict:
     creator_text = normalize_spaces(strip_tags(html.unescape(get_tag(item_xml, "dc:creator"))))
     authors = parse_rss_authors(creator_text)
     rss_snippet = extract_abstract_from_encoded(item_xml)
+    rss_cover_image = extract_cover_image_from_rss_item(item_xml)
 
     return {
         "title_en": title,
@@ -315,6 +337,7 @@ def build_item_stub(item_xml: str) -> Dict:
         "first_author": authors[0] if authors else "",
         "rss_snippet": rss_snippet,
         "rss_snippet_truncated": looks_truncated(rss_snippet),
+        "rss_cover_image": rss_cover_image,
     }
 
 

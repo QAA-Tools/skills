@@ -1,3 +1,4 @@
+import json
 import sys
 import types
 from pathlib import Path
@@ -53,6 +54,25 @@ def test_build_item_stub_extracts_rss_authors_from_dc_creator():
 
 
 
+def test_build_item_stub_extracts_rss_cover_image():
+    item_xml = """
+    <item>
+      <title>Image Paper</title>
+      <link>http://example.com/paper</link>
+      <prism:doi>10.1103/test-image-doi</prism:doi>
+      <dc:creator>A. Author</dc:creator>
+      <dc:date>2026-05-14T10:00:00+00:00</dc:date>
+      <description>&lt;p&gt;Abstract.&lt;/p&gt;&lt;img src=\"//cdn.journals.aps.org/journals/PRL/key_images/test.png\" /&gt;</description>
+      <content:encoded><![CDATA[<p>Abstract text.</p>]]></content:encoded>
+    </item>
+    """
+
+    stub = prl_rss_extract.build_item_stub(item_xml)
+
+    assert stub["rss_cover_image"] == "https://cdn.journals.aps.org/journals/PRL/key_images/test.png"
+
+
+
 def test_build_item_stub_keeps_only_text_inside_escaped_xml_author_tags():
     item_xml = """
     <item>
@@ -93,6 +113,8 @@ def test_fake_fill_from_raw_preserves_author_fields():
     assert result["papers"][0]["authors"] == ["A Author", "B Author"]
     assert result["papers"][0]["first_author"] == "A Author"
     assert result["papers"][0]["author_text"] == "A Author and B Author"
+    assert result["papers"][0]["paper_url"] == ""
+    assert result["papers"][0]["rss_cover_image"] == ""
 
 
 
@@ -127,6 +149,88 @@ def test_api_fill_from_raw_preserves_author_fields(monkeypatch):
     assert result["papers"][0]["authors"] == ["A Author", "B Author"]
     assert result["papers"][0]["first_author"] == "A Author"
     assert result["papers"][0]["author_text"] == "A Author and B Author"
+    assert result["papers"][0]["paper_url"] == ""
+    assert result["papers"][0]["rss_cover_image"] == ""
+
+
+
+def test_fake_fill_from_raw_preserves_paper_url_from_link():
+    raw = {
+        "date": "2026-04-30",
+        "items": [
+            {
+                "title_en": "Test Title",
+                "doi": "10.1103/test-doi",
+                "abstract_en": "A valid abstract.",
+                "link": "http://example.com/paper-1",
+                "rss_cover_image": "https://example.com/cover-1.png",
+            }
+        ],
+    }
+
+    result = prl_llm_core.fake_fill_from_raw(raw, selected_n=1, other_n=0)
+
+    assert result["papers"][0]["paper_url"] == "http://example.com/paper-1"
+    assert result["papers"][0]["rss_cover_image"] == "https://example.com/cover-1.png"
+
+
+
+def test_issue_composition_summary_splits_condensed_and_recent_counts():
+    raw = {
+        "date": "2026-06-02",
+        "feed_date_condensed": "2026-05-28",
+        "feed_date_recent": "2026-05-27",
+        "item_count_today_condensed": 6,
+        "item_count_today_recent": 4,
+    }
+
+    meta = prl_llm_core.issue_meta_from_raw(raw)
+    desc = prl_llm_core.build_publish_desc({}, raw)
+
+    assert meta["issue_composition_summary"] == "本次凝聚态 6 篇（2026-05-28），其他 PRL 方向补充 4 篇（2026-05-27）。"
+    assert meta["cover_subtitle"] == "本次凝聚态 6 篇（2026-05-28），其他 PRL 方向补充 4 篇（2026-05-27）。"
+    assert "本次凝聚态 6 篇（2026-05-28），其他 PRL 方向补充 4 篇（2026-05-27）。" in desc
+
+
+
+def test_choose_cover_image_url_falls_back_to_second_paper(tmp_path):
+    input_path = tmp_path / "input.json"
+    input_path.write_text(
+        '{"papers": ['
+        '{"title_en": "A", "rss_cover_image": ""}, '
+        '{"title_en": "B", "rss_cover_image": "https://example.com/cover-2.png"}, '
+        '{"title_en": "C", "rss_cover_image": "https://example.com/cover-3.png"}'
+        ']}'
+    )
+
+    assert render_prl_bilibili_cover.choose_cover_image_url(str(input_path)) == "https://example.com/cover-2.png"
+
+
+
+def test_choose_cover_image_url_randomizes_within_selected_papers_when_all_rss_dates_stale(tmp_path):
+    input_path = tmp_path / "input.json"
+    input_path.write_text(
+        json.dumps(
+            {
+                "date": "2026-06-02",
+                "feed_date_condensed": "2026-05-28",
+                "feed_date_recent": "2026-05-27",
+                "papers": [
+                    {"title_en": "A", "rss_cover_image": "https://example.com/cover-1.png", "rss_date": "2026-05-28T10:00:00+00:00"},
+                    {"title_en": "B", "rss_cover_image": "https://example.com/cover-2.png", "rss_date": "2026-05-27T10:00:00+00:00"},
+                    {"title_en": "C", "rss_cover_image": "https://example.com/cover-3.png", "rss_date": "2026-05-27T10:00:00+00:00"},
+                ],
+            }
+        )
+    )
+
+    chosen = render_prl_bilibili_cover.choose_cover_image_url(str(input_path), local_date="2026-06-02")
+
+    assert chosen in {
+        "https://example.com/cover-1.png",
+        "https://example.com/cover-2.png",
+        "https://example.com/cover-3.png",
+    }
 
 
 
