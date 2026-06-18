@@ -20,6 +20,7 @@ import argparse
 import datetime as dt
 import html
 import json
+import logging
 import os
 import re
 import time
@@ -28,6 +29,8 @@ from typing import Dict, List, Optional
 from urllib.parse import quote
 
 import requests
+
+_LOG = logging.getLogger(__name__)
 
 DEFAULT_FEED_URL = "https://feeds.aps.org/rss/tocsec/PRL-CondensedMatterStructureetc.xml"
 RECENT_FEED_URL = "https://feeds.aps.org/rss/recent/prl.xml"
@@ -205,10 +208,66 @@ def safe_get_json(url: str, timeout: int = 30) -> dict:
     return resp.json()
 
 
-def openalex_search_by_title(title_en: str, per_page: int = 10) -> list[dict]:
-    url = f"{OPENALEX_URL}?search={quote(latex_to_plain_text(title_en))}&per-page={per_page}"
+_LUCENE_SPECIAL_RE = re.compile(r'&&|\|\||[+\-!(){}\[\]^"~*?:\\/]')
+_NON_ASCII_ALNUM_RE = re.compile(r'[^A-Za-z0-9 ]')
+_OPENALEX_AGGRESSIVE_MAX_CHARS = 200
+
+
+def _collapse_whitespace(s: str) -> str:
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def sanitize_openalex_query(s: str) -> str:
+    return _collapse_whitespace(_LUCENE_SPECIAL_RE.sub(" ", s or ""))
+
+
+def aggressive_sanitize_openalex_query(s: str, max_chars: int = _OPENALEX_AGGRESSIVE_MAX_CHARS) -> str:
+    cleaned = _collapse_whitespace(_NON_ASCII_ALNUM_RE.sub(" ", s or ""))
+    return cleaned[:max_chars].rstrip()
+
+
+def _openalex_fetch_results(query: str, per_page: int) -> list[dict]:
+    url = f"{OPENALEX_URL}?search={quote(query)}&per-page={per_page}"
     data = safe_get_json(url)
     return data.get("results") or []
+
+
+def _is_retryable_http_error(exc: requests.RequestException) -> bool:
+    if isinstance(exc, requests.HTTPError):
+        status = getattr(exc.response, "status_code", None) or 0
+        return status >= 500
+    return True
+
+
+def openalex_search_by_title(title_en: str, per_page: int = 10) -> list[dict]:
+    base_text = latex_to_plain_text(title_en)
+    primary = sanitize_openalex_query(base_text)
+
+    if primary:
+        try:
+            return _openalex_fetch_results(primary, per_page)
+        except (requests.RequestException, ValueError) as exc:
+            if isinstance(exc, requests.RequestException) and _is_retryable_http_error(exc):
+                _LOG.warning("openalex primary retry after %s", exc)
+                time.sleep(1.5)
+                try:
+                    return _openalex_fetch_results(primary, per_page)
+                except (requests.RequestException, ValueError) as retry_exc:
+                    _LOG.warning("openalex primary retry failed: %s", retry_exc)
+            else:
+                _LOG.warning("openalex primary returned non-retryable %s", exc)
+
+    aggressive = aggressive_sanitize_openalex_query(base_text)
+    if not aggressive or aggressive == primary:
+        _LOG.warning("openalex aggressive fallback skipped (empty or identical to primary)")
+        return []
+
+    try:
+        _LOG.info("openalex aggressive fallback query: %r", aggressive)
+        return _openalex_fetch_results(aggressive, per_page)
+    except (requests.RequestException, ValueError) as exc:
+        _LOG.warning("openalex aggressive fallback failed: %s", exc)
+        return []
 
 
 def get_work_source_name(work: dict) -> str:
@@ -341,12 +400,30 @@ def build_item_stub(item_xml: str) -> Dict:
     }
 
 
+def _empty_openalex_result() -> Dict:
+    return {
+        "results_checked": 0,
+        "matched_prl_record": False,
+        "matched_prl_with_abstract": False,
+        "matched_same_title_preprint": False,
+        "matched_same_title_preprint_with_abstract": False,
+        "chosen": None,
+        "abstract_source": "",
+        "top_matches": [],
+    }
+
+
 def enrich_item_payload(base_item: Dict) -> Dict:
     title = base_item.get("title_en") or ""
     doi = base_item.get("doi") or ""
     rss_snippet = normalize_spaces(base_item.get("rss_snippet") or "")
 
-    oa = choose_best_abstract_from_openalex(title, doi)
+    try:
+        oa = choose_best_abstract_from_openalex(title, doi)
+    except Exception as exc:
+        _LOG.warning("openalex enrichment skipped for %r: %s", title, exc)
+        oa = _empty_openalex_result()
+
     chosen = oa.get("chosen") or {}
     openalex_abstract = normalize_spaces(chosen.get("abstract") or "")
     if openalex_abstract:

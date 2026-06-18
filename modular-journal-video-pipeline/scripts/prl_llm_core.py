@@ -209,22 +209,88 @@ def normalize_tag_text(text: str) -> str:
     return s
 
 
+PUBLISH_TAG_MAX_LEN = 8
+PUBLISH_TAG_SAFE_DEFAULTS = ["物理", "科研", "PRL"]
+
+
 def build_publish_tag_prompt(briefs: list[str]) -> str:
     joined = "\n".join(f"- {b}" for b in briefs if b)
     return (
-        "任务：根据这一期 PRL 稿件的全部一句话 brief，总结用于封面/发布的关键词标签。\n"
+        "输出内容只能是一行英文逗号分隔的标签。\n"
+        "不要输出 JSON、Markdown、编号、解释、前缀或后缀。\n\n"
+        "任务：根据这一期 PRL 稿件的全部一句话 brief，总结用于 B 站发布的关键词标签。\n\n"
         "要求：\n"
-        "1. 直接返回一行关键词，用英文逗号分隔。\n"
-        "2. 返回 4~12 个中文关键词。\n"
-        "3. 每个关键词 2~4 个字，尽量短，不要写成句子。\n"
-        "4. 优先提炼这一期反复出现或最核心的研究主题，不要机械罗列每篇论文各一个词。\n"
-        "5. 不要输出泛词，如 研究、论文、物理、结果、方法、进展、系统。\n"
-        "6. 保留必要英文或符号，如 Moiré、Lyman-α、Transmon、Fe(Te,Se)。\n"
-        "7. 不要重复、不要同义改写。\n"
-        "8. 除这一行关键词外，不要补充解释或前后缀。\n"
+        "1. 返回 4 到 12 个标签。\n"
+        "2. 每个标签必须是 2 到 4 个汉字或字符。\n"
+        "3. 优先提炼本期反复出现或最核心的研究主题，不要机械罗列每篇论文各一个词。\n"
+        "4. 不要把多个概念粘成一个标签；不要写成长句。\n"
+        "5. 不要输出泛词或普通机制词，如 研究、论文、物理、结果、方法、进展、系统、规则、模型、耦合、相互作用。\n"
+        "6. 不要重复或输出同义改写标签。\n"
+        "7. 必要时可保留英文或符号，如 Moiré、Lyman-α、Transmon、Fe(Te,Se)，但仍需满足长度限制。\n\n"
         "全部 briefs：\n"
         f"{joined}"
     )
+
+
+def parse_publish_tag_items(raw_output: str) -> list[str]:
+    raw_output = strip_code_fences(raw_output or "").strip()
+    raw_items: list[str] = []
+    if raw_output.startswith("{") or raw_output.startswith("["):
+        try:
+            parsed = json.loads(raw_output)
+        except Exception:
+            parsed = None
+        raw_tags = None
+        if isinstance(parsed, dict):
+            raw_tags = parsed.get("tags") or parsed.get("keywords") or parsed.get("keyword")
+        elif isinstance(parsed, list):
+            raw_tags = parsed
+        if isinstance(raw_tags, str):
+            raw_items = [x.strip() for x in raw_tags.split(",") if x.strip()]
+        elif isinstance(raw_tags, list):
+            raw_items = [str(x or "").strip() for x in raw_tags if str(x or "").strip()]
+    if not raw_items:
+        raw_items = [x.strip() for x in raw_output.replace("\n", ",").split(",") if x.strip()]
+    return raw_items
+
+
+def clean_publish_tags(raw_items: list[str], *, limit: int = 12, max_len: int = PUBLISH_TAG_MAX_LEN) -> tuple[list[str], bool]:
+    tags: list[str] = []
+    invalid = False
+    seen_raw = 0
+    for item in raw_items:
+        seen_raw += 1
+        tag = normalize_tag_text(item)
+        if not tag:
+            invalid = True
+            continue
+        if len(tag) > max_len:
+            invalid = True
+            continue
+        if tag in tags:
+            invalid = True
+            continue
+        tags.append(tag)
+    if seen_raw == 0 or len(tags) < 4 or len(tags) > min(12, limit) or len(raw_items) > min(12, limit):
+        invalid = True
+    return tags[: min(12, limit)], invalid
+
+
+def fallback_publish_tags_from_papers(papers: list[dict], *, limit: int = 12) -> list[str]:
+    tags: list[str] = []
+    texts = []
+    for paper in papers[:8]:
+        texts.append((paper.get("title_zh") or "").strip())
+        texts.append((paper.get("title_en") or "").strip())
+        texts.append((paper.get("brief") or "").strip())
+    blob = "\n".join([t for t in texts if t]).lower()
+    for pattern, label in PUBLISH_TAG_RULES:
+        if re.search(pattern, blob, flags=re.I) and label not in tags:
+            tags.append(label)
+    for label in PUBLISH_TAG_DEFAULTS:
+        if label not in tags:
+            tags.append(label)
+    return tags[: min(12, limit)]
 
 
 def build_publish_tags(data: dict, *, limit: int = 12) -> str:
@@ -232,53 +298,27 @@ def build_publish_tags(data: dict, *, limit: int = 12) -> str:
     briefs = [normalize_mixed_spacing((paper.get("brief") or "").strip()) for paper in papers]
     briefs = [b for b in briefs if b]
     tags: list[str] = []
+    api_failed = False
 
     if briefs:
+        prompt = build_publish_tag_prompt(briefs)
         try:
-            raw_output = strip_code_fences(call_openai_compatible(build_publish_tag_prompt(briefs))).strip()
-            raw_items = []
-            if raw_output.startswith("{") or raw_output.startswith("["):
-                try:
-                    parsed = json.loads(raw_output)
-                except Exception:
-                    parsed = None
-                raw_tags = None
-                if isinstance(parsed, dict):
-                    raw_tags = parsed.get("tags") or parsed.get("keywords") or parsed.get("keyword")
-                elif isinstance(parsed, list):
-                    raw_tags = parsed
-                if isinstance(raw_tags, str):
-                    raw_items = [x.strip() for x in raw_tags.split(",") if x.strip()]
-                elif isinstance(raw_tags, list):
-                    raw_items = [str(x or "").strip() for x in raw_tags if str(x or "").strip()]
-            if not raw_items:
-                raw_items = [x.strip() for x in raw_output.replace("\n", ",").split(",") if x.strip()]
-            for item in raw_items:
-                tag = normalize_tag_text(item)
-                if not tag:
-                    continue
-                if tag in tags:
-                    continue
-                tags.append(tag)
-            if len(tags) >= 4:
-                tags = tags[: min(12, limit)]
+            for _attempt in range(2):
+                raw_items = parse_publish_tag_items(call_openai_compatible(prompt))
+                tags, invalid = clean_publish_tags(raw_items, limit=limit)
+                if not invalid:
+                    break
+            else:
+                api_failed = True
         except Exception:
             tags = []
 
-    if len(tags) < 4:
-        texts = []
-        for paper in papers[:8]:
-            texts.append((paper.get("title_zh") or "").strip())
-            texts.append((paper.get("title_en") or "").strip())
-            texts.append((paper.get("brief") or "").strip())
-        blob = "\n".join([t for t in texts if t]).lower()
-        for pattern, label in PUBLISH_TAG_RULES:
-            if re.search(pattern, blob, flags=re.I) and label not in tags:
-                tags.append(label)
-        for label in PUBLISH_TAG_DEFAULTS:
-            if label not in tags:
-                tags.append(label)
-        tags = tags[: min(12, limit)]
+    if not tags and not api_failed:
+        tags = fallback_publish_tags_from_papers(papers, limit=limit)
+
+    if api_failed and not tags:
+        tags = PUBLISH_TAG_SAFE_DEFAULTS[: min(12, limit)]
+        return ",".join(tags) + "\n# tag生成失败\n"
 
     tags = tags[: min(12, limit)]
     return ",".join(tags) + ("\n" if tags else "")
@@ -671,10 +711,10 @@ GENERATED_PREFIX_PATTERNS = [
 
 
 def strip_generated_prefixes(text: str) -> str:
-    s = normalize_mixed_spacing(text)
-    for pat in GENERATED_PREFIX_PATTERNS:
-        s = re.sub(pat, "", s)
-    return normalize_mixed_spacing(s)
+    # Preserve API wording verbatim except for whitespace/formula normalization.
+    # Do not remove leading phrases such as “作者建立了” or “这篇工作”, because
+    # regex trimming can turn a grammatical sentence into a fragment like “了声学散射...”.
+    return normalize_mixed_spacing(text)
 
 
 def looks_bad_generated_text(text: str) -> bool:

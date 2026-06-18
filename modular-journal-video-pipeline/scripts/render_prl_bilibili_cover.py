@@ -157,7 +157,12 @@ def extract_keywords(input_json: str, *, tags_file: str = "", limit: int = 7):
     if tags_file:
         try:
             raw = Path(tags_file).read_text(encoding="utf-8")
-            items = [x.strip().lstrip("#") for x in raw.replace("\n", ",").split(",") if x.strip()]
+            items = []
+            for line in raw.splitlines():
+                line = line.strip()
+                if not line or line.startswith("#") or line.startswith("＃"):
+                    continue
+                items.extend(x.strip().lstrip("#＃") for x in line.split(",") if x.strip())
             keywords = []
             for item in items:
                 if item and item not in keywords:
@@ -202,10 +207,14 @@ def draw_keyword_cloud(draw: ImageDraw.ImageDraw, keywords, seed: int):
     rnd = random.Random(seed)
     font = ImageFont.truetype(FONT_REG_PATH, 54)
     colors = [
-        (93, 91, 255, 138),
-        (0, 184, 163, 130),
-        (122, 91, 255, 128),
-        (74, 88, 112, 124),
+        (93, 91, 255, 142),   # indigo
+        (0, 184, 163, 136),   # teal
+        (238, 124, 84, 138),  # coral
+        (40, 126, 210, 136),  # blue
+        (184, 92, 184, 132),  # magenta
+        (216, 151, 42, 136),  # amber
+        (58, 148, 98, 134),   # green
+        (74, 88, 112, 124),   # slate
     ]
 
     # Stable rows, but each row gets different loose x slots. This avoids the
@@ -338,7 +347,7 @@ def paste_cover_image(img: Image.Image, art: Image.Image, box) -> None:
         return
     resampling = getattr(Image, "Resampling", Image)
     lanczos = getattr(resampling, "LANCZOS", getattr(Image, "LANCZOS", 1))
-    scale = max(box_w / src_w, box_h / src_h) * 1.18
+    scale = max(box_w / src_w, box_h / src_h)
     resized = art.resize((max(1, int(src_w * scale)), max(1, int(src_h * scale))), lanczos)
     left = max(0, (resized.width - box_w) // 2)
     top = max(0, (resized.height - box_h) // 2)
@@ -393,12 +402,21 @@ def render_cover(date: str, out_path: Path, title: str = "", input_json: str = "
     d.text((left_x, title_y + 6), date.replace('-', '.'), fill=ACCENT_3, font=date_font)
     draw_keyword_cloud(d, extract_keywords(input_json, tags_file=tags_file), seed=seed + 17)
 
-    image_box = (1200, 175, 1780, 885)
-    d.rounded_rectangle(image_box, radius=46, fill=(244, 247, 255), outline=(220, 227, 241), width=3)
+    # PRL RSS key images are standardized 200x200 thumbnails. Preserve the
+    # original square image exactly; do not trim or crop internal white regions.
+    image_box = (1200, 250, 1780, 830)
     cover_image = load_cover_image(input_json, local_date=date)
     if cover_image is not None:
+        shadow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        sd = ImageDraw.Draw(shadow)
+        sx1, sy1, sx2, sy2 = image_box
+        sd.rounded_rectangle((sx1 + 10, sy1 + 14, sx2 + 10, sy2 + 14), radius=46, fill=(55, 70, 110, 26))
+        img.alpha_composite(shadow.filter(ImageFilter.GaussianBlur(16)))
         paste_cover_image(img, cover_image, image_box)
+        d = ImageDraw.Draw(img)
+        d.rounded_rectangle(image_box, radius=46, fill=None, outline=(232, 237, 248), width=2)
     else:
+        d.rounded_rectangle(image_box, radius=46, fill=(244, 247, 255), outline=(220, 227, 241), width=3)
         draw_orbit_motif(d)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)

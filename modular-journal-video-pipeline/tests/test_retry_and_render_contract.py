@@ -329,6 +329,19 @@ def test_voice_payload_does_not_reject_copy_like_intro():
 
 
 
+def test_voice_payload_preserves_api_prefix_without_trimming_to_fragment():
+    result = prl_llm_core.validate_voice_payload(
+        {"voice_intro": "作者建立了声学散射中因果律约束的普适求和规则。"}
+    )
+
+    assert result == {
+        "title_zh": "",
+        "voice_intro": "作者建立了声学散射中因果律约束的普适求和规则。",
+        "voice_points": [],
+    }
+
+
+
 def test_page_payload_does_not_reject_copy_like_keypoints():
     result = prl_llm_core.validate_page_payload(
         {
@@ -479,9 +492,10 @@ def test_build_publish_tags_prefers_api_summary_from_all_briefs(monkeypatch):
 
     assert "利用莱曼α森林约束原初黑洞暗物质丰度。" in seen["prompt"]
     assert "用猫态增强极弱暗物质信号的探测灵敏度。" in seen["prompt"]
-    assert "用英文逗号分隔" in seen["prompt"]
-    assert "返回 4~12 个中文关键词" in seen["prompt"]
-    assert "json" not in seen["prompt"].lower()
+    assert seen["prompt"].startswith("输出内容只能是一行英文逗号分隔的标签。")
+    assert "不要输出 JSON、Markdown、编号、解释、前缀或后缀。" in seen["prompt"]
+    assert "每个标签必须是 2 到 4 个汉字或字符。" in seen["prompt"]
+    assert "不要输出泛词或普通机制词" in seen["prompt"]
     assert result == "黑洞,暗物质,量子多体,无序相变,费米面\n"
 
 
@@ -501,6 +515,64 @@ def test_build_publish_tags_accepts_keywords_field(monkeypatch):
     result = prl_llm_core.build_publish_tags({"papers": [{"brief": "测试 brief。"}]})
 
     assert result == "对称性,马约拉纳,费米面,暗物质\n"
+
+
+
+def test_build_publish_tags_retries_same_prompt_when_api_tags_invalid(monkeypatch):
+    calls = []
+
+    def fake_call(prompt):
+        calls.append(prompt)
+        if len(calls) == 1:
+            return "声学求和规则多体非局域性超冷中子光镊阵列费米子量子模拟XY模型BKT相变代数衰减相互作用,拓扑,莫尔,激子"
+        return "声学规则,光镊阵列,量子模拟,BKT相变"
+
+    monkeypatch.setattr(prl_llm_core, "call_openai_compatible", fake_call)
+
+    result = prl_llm_core.build_publish_tags({"papers": [{"brief": "测试 brief。"}]})
+
+    assert len(calls) == 2
+    assert calls[0] == calls[1]
+    assert result == "声学规则,光镊阵列,量子模拟,BKT相变\n"
+
+
+
+def test_build_publish_tags_cleans_invalid_second_api_result(monkeypatch):
+    calls = []
+
+    def fake_call(prompt):
+        calls.append(prompt)
+        return "声学求和规则多体非局域性超冷中子光镊阵列费米子量子模拟XY模型BKT相变代数衰减相互作用,拓扑,莫尔,拓扑,,量子霍尔"
+
+    monkeypatch.setattr(prl_llm_core, "call_openai_compatible", fake_call)
+
+    result = prl_llm_core.build_publish_tags({"papers": [{"brief": "测试 brief。"}]})
+
+    assert len(calls) == 2
+    assert result == "拓扑,莫尔,量子霍尔\n"
+
+
+
+def test_build_publish_tags_marks_failure_and_uses_safe_defaults_when_all_api_tags_invalid(monkeypatch):
+    monkeypatch.setattr(
+        prl_llm_core,
+        "call_openai_compatible",
+        lambda _prompt: "声学求和规则多体非局域性超冷中子光镊阵列,另一个非常非常长的标签",
+    )
+
+    result = prl_llm_core.build_publish_tags({"papers": [{"brief": "没有可匹配规则的测试 brief。"}]})
+
+    assert result == "物理,科研,PRL\n# tag生成失败\n"
+
+
+
+def test_cover_extract_keywords_ignores_tag_failure_comment(tmp_path):
+    tags_path = tmp_path / "publish_tags.txt"
+    tags_path.write_text("物理,科研,PRL\n# tag生成失败\n", encoding="utf-8")
+
+    result = render_prl_bilibili_cover.extract_keywords("", tags_file=str(tags_path), limit=7)
+
+    assert result == ["物理", "科研", "PRL"]
 
 
 
@@ -626,3 +698,119 @@ def test_request_text_with_retry_accepts_pure_number_without_retry(monkeypatch):
 
     assert result == 8.7
     assert calls["count"] == 1
+
+
+# ---- OpenAlex search sanitizer + fallback ----
+
+def test_sanitize_openalex_query_replaces_lucene_specials_with_spaces():
+    title = "Ds0*(2317)+→Ds*+γ"
+    cleaned = prl_rss_extract.sanitize_openalex_query(title)
+    assert "*" not in cleaned
+    assert "+" not in cleaned
+    assert "(" not in cleaned and ")" not in cleaned
+    assert "→" in cleaned and "γ" in cleaned
+    assert "Ds0" in cleaned and "2317" in cleaned
+    assert "  " not in cleaned
+
+
+def test_aggressive_sanitize_openalex_query_keeps_only_ascii_alnum_and_truncates():
+    title = "Ds0*(2317)+→Ds*+γ Decay"
+    cleaned = prl_rss_extract.aggressive_sanitize_openalex_query(title)
+    assert cleaned == "Ds0 2317 Ds Decay"
+
+    long_title = "abcdef " * 60
+    capped = prl_rss_extract.aggressive_sanitize_openalex_query(long_title, max_chars=50)
+    assert len(capped) <= 50
+
+
+def test_openalex_search_uses_sanitized_query_on_happy_path(monkeypatch):
+    captured = {}
+
+    def fake_safe_get_json(url, timeout=30):
+        captured["url"] = url
+        return {"results": [{"id": "W1"}]}
+
+    monkeypatch.setattr(prl_rss_extract, "safe_get_json", fake_safe_get_json)
+
+    results = prl_rss_extract.openalex_search_by_title("Ds0*(2317)+→Ds*+γ", per_page=12)
+
+    assert results == [{"id": "W1"}]
+    assert "%2A" not in captured["url"]
+    assert "%2B" not in captured["url"]
+    assert "per-page=12" in captured["url"]
+
+
+def test_openalex_search_skips_retry_on_4xx_and_falls_back_to_aggressive(monkeypatch):
+    import requests as _requests
+
+    calls = []
+
+    def fake_safe_get_json(url, timeout=30):
+        calls.append(url)
+        if len(calls) == 1:
+            resp = _requests.Response()
+            resp.status_code = 400
+            raise _requests.HTTPError("400 Client Error", response=resp)
+        return {"results": [{"id": "W_AGGR"}]}
+
+    monkeypatch.setattr(prl_rss_extract, "safe_get_json", fake_safe_get_json)
+
+    results = prl_rss_extract.openalex_search_by_title("Ds0*(2317)+→Ds*+γ", per_page=10)
+
+    assert results == [{"id": "W_AGGR"}]
+    assert len(calls) == 2  # primary 400, then aggressive — no retry of primary
+
+
+def test_openalex_search_retries_primary_on_timeout_then_succeeds(monkeypatch):
+    import requests as _requests
+
+    calls = []
+
+    def fake_safe_get_json(url, timeout=30):
+        calls.append(url)
+        if len(calls) == 1:
+            raise _requests.ReadTimeout("timed out")
+        return {"results": [{"id": "W_RETRY"}]}
+
+    monkeypatch.setattr(prl_rss_extract, "safe_get_json", fake_safe_get_json)
+    monkeypatch.setattr(prl_rss_extract.time, "sleep", lambda *_a, **_k: None)
+
+    results = prl_rss_extract.openalex_search_by_title("A Normal Title", per_page=10)
+
+    assert results == [{"id": "W_RETRY"}]
+    assert len(calls) == 2
+    assert calls[0] == calls[1]  # same query retried
+
+
+def test_openalex_search_returns_empty_when_all_attempts_fail(monkeypatch):
+    import requests as _requests
+
+    def always_fail(url, timeout=30):
+        raise _requests.ConnectionError("dns down")
+
+    monkeypatch.setattr(prl_rss_extract, "safe_get_json", always_fail)
+    monkeypatch.setattr(prl_rss_extract.time, "sleep", lambda *_a, **_k: None)
+
+    results = prl_rss_extract.openalex_search_by_title("Ds0*(2317)+→Ds*+γ", per_page=10)
+
+    assert results == []
+
+
+def test_enrich_item_payload_falls_back_to_rss_snippet_when_openalex_fails(monkeypatch):
+    def boom(_title, _doi):
+        raise RuntimeError("simulated openalex blow-up")
+
+    monkeypatch.setattr(prl_rss_extract, "choose_best_abstract_from_openalex", boom)
+
+    enriched = prl_rss_extract.enrich_item_payload({
+        "title_en": "Some PRL Paper",
+        "doi": "10.1103/test",
+        "rss_snippet": "RSS abstract sentence.",
+    })
+
+    assert enriched["abstract_en"] == "RSS abstract sentence."
+    assert enriched["abstract_source"] == "rss_snippet"
+    assert enriched["openalex_results_checked"] == 0
+    assert enriched["matched_prl_record"] is False
+    assert enriched["openalex_top_matches"] == []
+    assert enriched["missing_any_abstract"] is False
